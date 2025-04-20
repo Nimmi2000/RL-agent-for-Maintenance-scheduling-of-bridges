@@ -34,6 +34,7 @@ class bridgedeterioration(gym.Env):
         self.max_step = 200
         self.state = None
 
+        # Read the csv and create extra metrics for tracking the health condition of the bridges
         df = pd.read_csv(df_path)
         self.bridge_ids = df['bridge_id'].to_numpy()
         
@@ -45,7 +46,7 @@ class bridgedeterioration(gym.Env):
         bridge_features['reliability'] = 0.0
         bridge_features['capital_invested'] = 0.0
 
-        self.bridges = bridge_features.to_numpy().astype('float32')
+        self.bridges = bridge_features.to_numpy().astype('float64')
 
         self.num_bridges = len(self.bridges)
         self.observation_shape = self.bridges.shape
@@ -57,6 +58,7 @@ class bridgedeterioration(gym.Env):
         self.action_space = spaces.MultiDiscrete([6] * 15)
         self.observation_space = spaces.Box(0, np.inf , shape=(len(self.bridges), self.bridges.shape[1]), dtype=np.float64)
 
+    #Weibull model for calculation the survival function
     def calculate_sf(self, bridges, Mu, beta):
         return np.exp(-(bridges[:, OBS.aux_age]/ (Mu/(1 +(bridges[:, OBS.traf_int]/30000))))**beta)
 
@@ -76,39 +78,59 @@ class bridgedeterioration(gym.Env):
         # Conditions for 'do nothing' and 'apply maintenance while aux age > 10'
         # If age maintenance is done with aux age <= 10, don't increase aux age
 
-        # conditions = [actions == Action.Nothing, actions == Action.Monitoring, (actions == Action.Minor_intervention) & (self.state[:, OBS.aux_age] > 15), (actions == Action.Medium_intervention) & (self.state[:, OBS.aux_age] > 30), (actions == Action.Major_intervention) & (self.state[:, OBS.aux_age] > 45) ]
+        # Impact on aux age based on the actions taken
         conditions = [actions == Action.Nothing, actions == Action.Monitoring, actions == Action.Minor_intervention, actions == Action.Medium_intervention, actions == Action.Major_intervention]
         choices = [1, 1, -20, -40, -60]
-        self.state[:, OBS.aux_age] += np.select(conditions, choices, default= 1)
+
+        delta_age = np.select(conditions, choices, default=1)
+        self.state[:, OBS.aux_age] = np.maximum(1, self.state[:, OBS.aux_age] + delta_age)
 
         self.state[np.where(actions == Action.Replace)[0], OBS.aux_age] = 1  # Set aux age to 1 for replace actions
 
-        # Update failure probabilities
+        # Calculate cost for each step
+        action_costs = np.zeros(self.num_bridges, dtype=np.float32)
+        cost_map = {
+            Action.Nothing: 0.0,
+            Action.Monitoring: 1.0,  # Assign a small cost maybe? Or keep 0.
+            Action.Minor_intervention: 20.0,
+            Action.Medium_intervention: 40.0,
+            Action.Major_intervention: 60.0,
+            Action.Replace: 100.0
+        }
+
+        # Ensure actions are INT format
+        int_actions = np.array(actions).astype(int)
+        for i, action_val in enumerate(int_actions):
+            action_costs[i] = cost_map.get(Action(action_val), 0.0) # Use Action enum
+
+        # This will not be used for reward, just tracking purpose
+        self.state[:, OBS.capital] += action_costs
+
+        # Update survival function
         self.state[:, OBS.sf] = self.calculate_sf(self.state, Mu=80, beta = 2)
+
+        #Calculating Failure probabilities
         self.state[:, OBS.fp] = 1 - self.state[:, OBS.sf]
 
-        conditions = [actions == Action.Nothing, actions == Action.Monitoring, actions == Action.Minor_intervention, actions == Action.Medium_intervention, actions == Action.Major_intervention, actions == Action.Replace]
-        choices = [0, 0, 20, 40, 60, 100]
-        self.state[:, OBS.capital] += np.select(conditions, choices, default= self.state[:, OBS.capital])
+        rewards = self.calculate_rewards(self.state, action_costs)
 
-        rewards = self.calculate_rewards(self.state)
-
-        rewards = -rewards
         assert np.where(self.state[:, OBS.fp] < 0)[0].size == 0, 'Negative fp'
 
         # Include state in info
-        info = {'state': self.state.copy()}  # Ensure a copy of the state is passed
+        info = {'state': self.state.copy()} 
 
         return self.state, rewards , done, False, info
 
     # Reset env to initial state
     def reset(self, seed = None):
 
-        if seed is not None:
-            self.set_seed(seed)
+        super().reset(seed = seed)
 
         self.current_step = 0
         self.state = self.bridges.copy()
+        self.state[:, OBS.capital] = 0.0
+        self.state[:, OBS.sf] = self.calculate_sf(self.state, Mu=80, beta = 2)
+        self.state[:, OBS.fp] = 1 - self.state[:, OBS.sf]
         return self.state, {}
     
     def render(self, mode='human'):
@@ -118,18 +140,13 @@ class bridgedeterioration(gym.Env):
         return self.state
 
     # Calculate rewards (actually costs) for given actions based on given state
-    def calculate_rewards(self, state):
+    def calculate_rewards(self, state, action_costs):
 
-        overall_age = np.sum(state[:, OBS.aux_age])
+        rewards = - (0.5 * np.sum(state[:, OBS.aux_age]) +
+                 0.4 * (np.sum(state[:, OBS.fp]) * 100) +
+                 0.1 * np.sum(action_costs))
 
-        overall_capital = np.sum(state[:, OBS.capital])
-
-        reward = 0.2*overall_age + 0.8*overall_capital
-
-        return reward
-
-    def _get_obs(self):
-        return self.state
+        return rewards
     
     def set_seed(self, seed=None):
         # Set seed for reproducibility
